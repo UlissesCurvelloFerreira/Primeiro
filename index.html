@@ -2,8 +2,8 @@
 <html lang="pt-BR">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="theme-color" content="#171416">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#100e0f">
   <meta name="description" content="Gerador e leitor experimental de códigos circulares para links.">
   <title>Código Circular — Gerador e Leitor</title>
   <link rel="stylesheet" href="style.css">
@@ -13,7 +13,7 @@
     <div>
       <p class="eyebrow">PROTÓTIPO EXPERIMENTAL</p>
       <h1>Código Circular</h1>
-      <p class="subtitle">Codifique links, exporte o PNG e recupere o conteúdo pela câmera ou pela galeria.</p>
+      <p class="subtitle">Gere, compartilhe e leia códigos circulares usando a câmera ou uma imagem da galeria.</p>
     </div>
     <div class="status-pill" title="O processamento acontece apenas neste dispositivo">
       <span class="status-dot"></span>
@@ -44,7 +44,7 @@
         <span id="capacity-info">Capacidade calculada ao gerar</span>
       </div>
 
-      <button id="generate-button" class="button button-primary" type="button">
+      <button id="generate-button" class="button button-primary button-full" type="button">
         Gerar código circular
       </button>
 
@@ -83,12 +83,14 @@
       </div>
 
       <div id="camera-panel" class="reader-mode active" role="tabpanel">
-        <div class="camera-shell">
+        <div class="camera-shell" id="camera-shell">
           <video id="camera-video" playsinline muted></video>
+
           <div class="camera-empty" id="camera-empty">
             <div class="camera-icon">◉</div>
-            <p>Ative a câmera e mantenha o código centralizado e de frente.</p>
+            <p>Ative a câmera traseira para iniciar a leitura.</p>
           </div>
+
           <div class="scan-guide" aria-hidden="true">
             <div class="guide-circle"></div>
             <div class="guide-marker">
@@ -97,17 +99,36 @@
               <span class="guide-vertical"></span>
             </div>
           </div>
+
+          <div class="camera-feedback" aria-hidden="true">
+            <span id="feedback-focus" class="feedback-chip">Nitidez: —</span>
+            <span id="feedback-size" class="feedback-chip">Tamanho: —</span>
+            <span id="feedback-light" class="feedback-chip">Luz: —</span>
+          </div>
+
+          <div id="scan-state" class="scan-state" aria-live="polite">Câmera desativada</div>
         </div>
 
-        <div class="action-row action-row-wrap">
+        <p class="camera-hint" id="camera-hint">
+          Mantenha o código inteiro dentro do círculo, com o marcador quadrado no centro e o celular paralelo à imagem.
+        </p>
+
+        <div class="camera-controls">
           <button id="start-camera-button" class="button button-secondary" type="button">Ativar câmera</button>
           <button id="scan-camera-button" class="button button-primary" type="button" disabled>Ler agora</button>
+          <button id="torch-button" class="button button-secondary" type="button" hidden>Ligar luz</button>
           <button id="stop-camera-button" class="button button-ghost" type="button" disabled>Desativar</button>
         </div>
 
+        <div id="zoom-control" class="zoom-control" hidden>
+          <label for="camera-zoom">Zoom da câmera</label>
+          <input id="camera-zoom" type="range" min="1" max="1" step="0.1" value="1">
+          <output id="camera-zoom-value" for="camera-zoom">1,0×</output>
+        </div>
+
         <label class="check-row">
-          <input id="auto-scan" type="checkbox">
-          <span>Tentar leitura automática enquanto a câmera estiver ativa</span>
+          <input id="auto-scan" type="checkbox" checked>
+          <span>Leitura automática contínua</span>
         </label>
       </div>
 
@@ -115,7 +136,7 @@
         <label for="gallery-input" class="upload-area">
           <span class="upload-icon">↥</span>
           <strong>Selecionar imagem</strong>
-          <span>PNG, JPEG ou WEBP. Para melhores resultados, use uma imagem centralizada.</span>
+          <span>PNG, JPEG ou WEBP. O leitor tenta corrigir rotação e pequenas diferenças de escala.</span>
         </label>
         <input id="gallery-input" class="sr-only" type="file" accept="image/png,image/jpeg,image/webp">
         <img id="gallery-preview" class="gallery-preview" alt="Imagem selecionada para leitura" hidden>
@@ -132,9 +153,18 @@
         </div>
       </div>
 
+      <div class="tips-box">
+        <strong>Para ler mais rápido</strong>
+        <ul>
+          <li>Use o PNG original ou exiba o código em uma tela com brilho médio.</li>
+          <li>Evite reflexos e mantenha todos os cinco anéis visíveis.</li>
+          <li>Aproxime até o círculo ocupar aproximadamente 75% a 88% do quadro.</li>
+        </ul>
+      </div>
+
       <p class="security-note">
         A câmera funciona em <strong>localhost</strong> ou em uma página publicada com <strong>HTTPS</strong>.
-        O leitor foi projetado para os códigos produzidos por esta versão web.
+        Nenhuma imagem é enviada para servidor externo.
       </p>
     </section>
   </main>
@@ -143,11 +173,11 @@
     <h2>Como esta versão funciona</h2>
     <p>
       O conteúdo é compactado com dicionário de URLs e Huffman canônico, protegido por CRC32 e distribuído em cinco anéis.
-      A cor de cada traço armazena um bit e a largura do intervalo seguinte armazena outro. O marcador quadrado central ajuda no enquadramento.
+      A cor de cada traço armazena um bit e a largura do intervalo seguinte armazena outro. O marcador central auxilia na localização e na rotação.
     </p>
   </section>
 
-  <canvas id="analysis-canvas" width="900" height="900" hidden></canvas>
+  <canvas id="analysis-canvas" width="1024" height="1024" hidden></canvas>
 
   <script src="app.js" defer></script>
 </body>
