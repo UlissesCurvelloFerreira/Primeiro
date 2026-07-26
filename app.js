@@ -19,7 +19,11 @@ const CONFIG = Object.freeze({
   headerSize: 12,
   maskSeed: 0x6D2B79F5,
   outputSize: 1400,
-  analysisSize: 900,
+  analysisSize: 1024,
+  markerSize: 18,
+  markerDotRadius: 0.10,
+  cameraScanIntervalMs: 420,
+  cameraConfirmations: 1,
 });
 
 const DICTIONARY = new Map([
@@ -403,9 +407,9 @@ function prepareEncodedBits(content) {
 // ============================================================
 
 function drawCentralMarker(context, centerX, centerY, scale) {
-  const markerSize = 16 * scale;
+  const markerSize = CONFIG.markerSize * scale;
   const half = markerSize / 2;
-  const stroke = Math.max(5, 0.85 * scale);
+  const stroke = Math.max(5, 0.95 * scale);
 
   context.save();
   context.strokeStyle = CONFIG.bit1Color;
@@ -414,9 +418,11 @@ function drawCentralMarker(context, centerX, centerY, scale) {
   context.lineCap = "round";
   context.lineJoin = "round";
 
+  // Moldura quadrada: fornece centro e escala de referência.
   context.strokeRect(centerX - half, centerY - half, markerSize, markerSize);
 
-  const crossHalf = markerSize * 0.24;
+  // Cruz central: ajuda o usuário a alinhar o código ao guia da câmera.
+  const crossHalf = markerSize * 0.23;
   context.beginPath();
   context.moveTo(centerX - crossHalf, centerY);
   context.lineTo(centerX + crossHalf, centerY);
@@ -424,8 +430,8 @@ function drawCentralMarker(context, centerX, centerY, scale) {
   context.lineTo(centerX, centerY + crossHalf);
   context.stroke();
 
-  // Ponto assimétrico: indica orientação e elimina ambiguidade visual de 90°.
-  const dotRadius = markerSize * 0.075;
+  // Ponto assimétrico maior: oferece uma estimativa rápida da rotação.
+  const dotRadius = markerSize * CONFIG.markerDotRadius;
   context.beginPath();
   context.arc(
     centerX + markerSize * 0.29,
@@ -518,6 +524,70 @@ function imageDataToGray(imageData) {
   return gray;
 }
 
+function percentileFromHistogram(gray, percentile) {
+  const histogram = new Uint32Array(256);
+  for (const value of gray) histogram[value] += 1;
+  const target = Math.max(0, Math.min(gray.length - 1, Math.floor(gray.length * percentile)));
+  let accumulated = 0;
+  for (let value = 0; value < 256; value += 1) {
+    accumulated += histogram[value];
+    if (accumulated > target) return value;
+  }
+  return 255;
+}
+
+function normalizeGray(gray) {
+  const low = percentileFromHistogram(gray, 0.02);
+  const high = percentileFromHistogram(gray, 0.995);
+  if (high - low < 24) return gray.slice();
+
+  const normalized = new Uint8Array(gray.length);
+  const multiplier = 255 / (high - low);
+  for (let index = 0; index < gray.length; index += 1) {
+    normalized[index] = Math.max(0, Math.min(255, Math.round((gray[index] - low) * multiplier)));
+  }
+  return normalized;
+}
+
+function sharpenGray(gray, width, height) {
+  const result = gray.slice();
+  for (let y = 1; y < height - 1; y += 1) {
+    const row = y * width;
+    for (let x = 1; x < width - 1; x += 1) {
+      const index = row + x;
+      const neighbors = (
+        gray[index - width] + gray[index + width] +
+        gray[index - 1] + gray[index + 1]
+      ) / 4;
+      result[index] = Math.max(0, Math.min(255, Math.round(gray[index] * 1.55 - neighbors * 0.55)));
+    }
+  }
+  return result;
+}
+
+function calculateFrameQuality(gray, width, height) {
+  let sumSquaredLaplacian = 0;
+  let laplacianCount = 0;
+  // O percentil 90 representa melhor a iluminação dos traços do que a média,
+  // pois grande parte do quadro é propositalmente escura.
+  const brightness = percentileFromHistogram(gray, 0.96);
+
+  for (let y = 2; y < height - 2; y += 4) {
+    for (let x = 2; x < width - 2; x += 4) {
+      const index = y * width + x;
+      const laplacian = 4 * gray[index] - gray[index - 1] - gray[index + 1] -
+        gray[index - width] - gray[index + width];
+      sumSquaredLaplacian += laplacian * laplacian;
+      laplacianCount += 1;
+    }
+  }
+
+  return {
+    brightness,
+    sharpness: laplacianCount ? sumSquaredLaplacian / laplacianCount : 0,
+  };
+}
+
 function otsuThreshold(gray) {
   const histogram = new Uint32Array(256);
   for (const value of gray) histogram[value] += 1;
@@ -570,47 +640,155 @@ function sampleGray(gray, width, height, x, y) {
 }
 
 function estimateMarkerCenter(gray, width, height, threshold) {
-  const initialX = width / 2;
-  const initialY = height / 2;
-  const halfRegion = Math.floor(Math.min(width, height) * 0.18);
-  let brightCount = 0;
-  let markerMinX = Infinity;
-  let markerMaxX = -Infinity;
-  let markerMinY = Infinity;
-  let markerMaxY = -Infinity;
+  const frameCenter = { x: width / 2, y: height / 2 };
+  const minimumDimension = Math.min(width, height);
+  const halfRegion = Math.floor(minimumDimension * 0.34);
+  const minX = Math.max(1, Math.floor(frameCenter.x - halfRegion));
+  const maxX = Math.min(width - 2, Math.ceil(frameCenter.x + halfRegion));
+  const minY = Math.max(1, Math.floor(frameCenter.y - halfRegion));
+  const maxY = Math.min(height - 2, Math.ceil(frameCenter.y + halfRegion));
 
-  const minX = Math.max(0, Math.floor(initialX - halfRegion));
-  const maxX = Math.min(width - 1, Math.ceil(initialX + halfRegion));
-  const minY = Math.max(0, Math.floor(initialY - halfRegion));
-  const maxY = Math.min(height - 1, Math.ceil(initialY + halfRegion));
+  // O limiar mais alto privilegia o branco do marcador e evita que os
+  // traços cinza dos anéis dominem a busca por componentes.
+  const brightThreshold = Math.min(245, threshold + (255 - threshold) * 0.56);
+  const visited = new Uint8Array(width * height);
+  const queue = new Int32Array((maxX - minX + 1) * (maxY - minY + 1));
+  let best = null;
 
   for (let y = minY; y <= maxY; y += 1) {
     for (let x = minX; x <= maxX; x += 1) {
-      if (gray[y * width + x] > threshold) {
-        brightCount += 1;
-        markerMinX = Math.min(markerMinX, x);
-        markerMaxX = Math.max(markerMaxX, x);
-        markerMinY = Math.min(markerMinY, y);
-        markerMaxY = Math.max(markerMaxY, y);
+      const startIndex = y * width + x;
+      if (visited[startIndex] || gray[startIndex] < brightThreshold) continue;
+
+      let head = 0;
+      let tail = 0;
+      queue[tail++] = startIndex;
+      visited[startIndex] = 1;
+
+      let count = 0;
+      let componentMinX = x;
+      let componentMaxX = x;
+      let componentMinY = y;
+      let componentMaxY = y;
+
+      while (head < tail) {
+        const index = queue[head++];
+        const cy = Math.floor(index / width);
+        const cx = index - cy * width;
+        count += 1;
+        componentMinX = Math.min(componentMinX, cx);
+        componentMaxX = Math.max(componentMaxX, cx);
+        componentMinY = Math.min(componentMinY, cy);
+        componentMaxY = Math.max(componentMaxY, cy);
+
+        const neighbors = [index - 1, index + 1, index - width, index + width];
+        for (const nextIndex of neighbors) {
+          if (visited[nextIndex]) continue;
+          const ny = Math.floor(nextIndex / width);
+          const nx = nextIndex - ny * width;
+          if (nx < minX || nx > maxX || ny < minY || ny > maxY) continue;
+          visited[nextIndex] = 1;
+          if (gray[nextIndex] >= brightThreshold) queue[tail++] = nextIndex;
+        }
+      }
+
+      if (count < 35) continue;
+      const boxWidth = componentMaxX - componentMinX + 1;
+      const boxHeight = componentMaxY - componentMinY + 1;
+      const averageSize = (boxWidth + boxHeight) / 2;
+      if (averageSize < minimumDimension * 0.055 || averageSize > minimumDimension * 0.31) continue;
+
+      const aspect = Math.min(boxWidth, boxHeight) / Math.max(boxWidth, boxHeight);
+      if (aspect < 0.62) continue;
+
+      const centerX = (componentMinX + componentMaxX) / 2;
+      const centerY = (componentMinY + componentMaxY) / 2;
+      const centerDistance = Math.hypot(centerX - frameCenter.x, centerY - frameCenter.y);
+      if (centerDistance > minimumDimension * 0.27) continue;
+
+      const fillRatio = count / (boxWidth * boxHeight);
+      const squareScore = aspect * 4.2;
+      const sizeScore = 1.8 - Math.min(1.8, Math.abs(averageSize / minimumDimension - 0.19) * 8);
+      const distanceScore = 2.4 - Math.min(2.4, centerDistance / minimumDimension * 9);
+      const fillScore = fillRatio > 0.04 && fillRatio < 0.62 ? 1.2 : -1;
+      const score = squareScore + sizeScore + distanceScore + fillScore;
+
+      if (!best || score > best.score) {
+        best = {
+          x: centerX,
+          y: centerY,
+          markerSize: averageSize,
+          score,
+          source: "component",
+        };
       }
     }
   }
 
-  if (brightCount < 40 || !Number.isFinite(markerMinX)) {
-    return { x: initialX, y: initialY };
+  if (best) return best;
+
+  // Reserva segura: continua permitindo a leitura quando o marcador estiver
+  // desfocado, desde que o usuário o tenha alinhado ao guia central.
+  return {
+    x: frameCenter.x,
+    y: frameCenter.y,
+    markerSize: minimumDimension * 0.19,
+    score: 0,
+    source: "guide",
+  };
+}
+
+function estimateMarkerRotation(gray, width, height, marker) {
+  const angularSamples = 360;
+  const minimumRadius = marker.markerSize * 0.25;
+  const maximumRadius = marker.markerSize * 0.44;
+  const radiusSteps = 7;
+  const scores = new Float32Array(angularSamples);
+
+  for (let angleIndex = 0; angleIndex < angularSamples; angleIndex += 1) {
+    const angle = angleIndex * Math.PI * 2 / angularSamples;
+    let score = 0;
+    for (let radiusIndex = 0; radiusIndex < radiusSteps; radiusIndex += 1) {
+      const radius = minimumRadius + (maximumRadius - minimumRadius) * radiusIndex / (radiusSteps - 1);
+      score += sampleGray(
+        gray,
+        width,
+        height,
+        marker.x + radius * Math.cos(angle),
+        marker.y + radius * Math.sin(angle)
+      );
+    }
+    scores[angleIndex] = score / radiusSteps;
   }
 
-  // O ponto assimétrico altera o centro de massa, mas não altera a moldura
-  // quadrada. Por isso usamos o centro da caixa delimitadora do marcador.
-  const detectedX = (markerMinX + markerMaxX) / 2;
-  const detectedY = (markerMinY + markerMaxY) / 2;
-  const maxShift = Math.min(width, height) * 0.09;
-
-  if (Math.hypot(detectedX - initialX, detectedY - initialY) > maxShift) {
-    return { x: initialX, y: initialY };
+  // Suavização circular reduz picos isolados de ruído.
+  let bestAngle = 0;
+  let bestScore = -Infinity;
+  let mean = 0;
+  for (let index = 0; index < angularSamples; index += 1) {
+    const smooth = (
+      scores[(index + angularSamples - 2) % angularSamples] +
+      scores[(index + angularSamples - 1) % angularSamples] * 2 +
+      scores[index] * 3 +
+      scores[(index + 1) % angularSamples] * 2 +
+      scores[(index + 2) % angularSamples]
+    ) / 9;
+    mean += smooth;
+    if (smooth > bestScore) {
+      bestScore = smooth;
+      bestAngle = index;
+    }
   }
+  mean /= angularSamples;
 
-  return { x: detectedX, y: detectedY };
+  const confidence = bestScore - mean;
+  if (confidence < 10) return null;
+
+  // O ponto é desenhado a -45°. Logo, rotação global = ângulo observado + 45°.
+  return {
+    rotation: (bestAngle + 45) % 360,
+    confidence,
+  };
 }
 
 function buildRadialProfile(gray, width, height, center, threshold) {
@@ -789,35 +967,28 @@ function scoreRotation(gray, width, height, center, scale, globalRotation, direc
   return matches + Math.min(2.5, separation / 35) + Math.min(0.8, average / 320);
 }
 
-function findRotationCandidates(gray, width, height, center, scale) {
-  const rawCandidates = [];
+function circularDistance(a, b) {
+  const difference = Math.abs(a - b) % 360;
+  return Math.min(difference, 360 - difference);
+}
 
-  for (const direction of [1, -1]) {
-    for (let rotation = 0; rotation < 360; rotation += 0.5) {
-      rawCandidates.push({
-        rotation,
-        direction,
-        score: scoreRotation(gray, width, height, center, scale, rotation, direction),
-      });
-    }
-  }
-
+function selectDistinctRotationCandidates(rawCandidates, limit = 8) {
   rawCandidates.sort((a, b) => b.score - a.score);
   const selected = [];
 
   for (const candidate of rawCandidates) {
     const isNearExisting = selected.some((existing) => (
       existing.direction === candidate.direction &&
-      Math.min(
-        Math.abs(existing.rotation - candidate.rotation),
-        360 - Math.abs(existing.rotation - candidate.rotation)
-      ) < 2.2
+      circularDistance(existing.rotation, candidate.rotation) < 2.2
     ));
     if (!isNearExisting) selected.push(candidate);
-    if (selected.length >= 8) break;
+    if (selected.length >= limit) break;
   }
+  return selected;
+}
 
-  const refined = selected.map((candidate) => {
+function refineRotationCandidates(gray, width, height, center, scale, candidates) {
+  return candidates.map((candidate) => {
     let best = candidate;
     for (let offset = -1; offset <= 1.0001; offset += 0.05) {
       const rotation = (candidate.rotation + offset + 360) % 360;
@@ -827,9 +998,56 @@ function findRotationCandidates(gray, width, height, center, scale) {
       if (score > best.score) best = { rotation, direction: candidate.direction, score };
     }
     return best;
-  });
+  }).sort((a, b) => b.score - a.score);
+}
 
-  refined.sort((a, b) => b.score - a.score);
+function findRotationCandidates(gray, width, height, center, scale, rotationHint = null) {
+  // Caminho rápido: o ponto assimétrico do marcador já oferece uma boa
+  // aproximação da rotação. Procuramos somente perto desse ângulo primeiro.
+  if (rotationHint) {
+    const hinted = [];
+    for (let offset = -14; offset <= 14.0001; offset += 0.35) {
+      const rotation = (rotationHint.rotation + offset + 360) % 360;
+      hinted.push({
+        rotation,
+        direction: 1,
+        score: scoreRotation(gray, width, height, center, scale, rotation, 1),
+      });
+    }
+
+    const refinedHinted = refineRotationCandidates(
+      gray,
+      width,
+      height,
+      center,
+      scale,
+      selectDistinctRotationCandidates(hinted, 6)
+    );
+
+    if (refinedHinted.length && refinedHinted[0].score >= 19) return refinedHinted;
+  }
+
+  // Reserva robusta para imagens antigas, ponto encoberto ou imagem espelhada.
+  const rawCandidates = [];
+  for (const direction of [1, -1]) {
+    for (let rotation = 0; rotation < 360; rotation += 0.75) {
+      rawCandidates.push({
+        rotation,
+        direction,
+        score: scoreRotation(gray, width, height, center, scale, rotation, direction),
+      });
+    }
+  }
+
+  const refined = refineRotationCandidates(
+    gray,
+    width,
+    height,
+    center,
+    scale,
+    selectDistinctRotationCandidates(rawCandidates, 10)
+  );
+
   if (!refined.length || refined[0].score < 19) {
     throw new Error("Não consegui determinar a rotação do código. Evite reflexos e mantenha a câmera perpendicular.");
   }
@@ -985,13 +1203,24 @@ function decodeWithGeometry(gray, width, height, center, scale, candidate) {
   return decodePacket(bitsToBytes(logicalBits));
 }
 
-function decodeImageData(imageData) {
-  const gray = imageDataToGray(imageData);
+function centerCandidatesAround(marker, minimumDimension) {
+  const delta = Math.max(1.5, minimumDimension * 0.0028);
+  const offsets = [
+    [0, 0],
+    [-delta, 0], [delta, 0], [0, -delta], [0, delta],
+    [-delta, -delta], [delta, -delta], [-delta, delta], [delta, delta],
+  ];
+  return offsets.map(([dx, dy]) => ({ x: marker.x + dx, y: marker.y + dy }));
+}
+
+function decodeGrayVariant(gray, width, height) {
   const threshold = otsuThreshold(gray);
-  const center = estimateMarkerCenter(gray, imageData.width, imageData.height, threshold);
-  const profile = buildRadialProfile(gray, imageData.width, imageData.height, center, threshold);
+  const marker = estimateMarkerCenter(gray, width, height, threshold);
+  const rotationHint = estimateMarkerRotation(gray, width, height, marker);
+  const profile = buildRadialProfile(gray, width, height, marker, threshold);
   const scaleEstimate = estimateScale(profile);
-  const scaleMultipliers = [1, 0.996, 1.004, 0.99, 1.01];
+  const scaleMultipliers = [1, 0.996, 1.004, 0.99, 1.01, 0.984, 1.016];
+  const centers = centerCandidatesAround(marker, Math.min(width, height));
   let lastError = null;
 
   for (const multiplier of scaleMultipliers) {
@@ -999,7 +1228,12 @@ function decodeImageData(imageData) {
     let candidates;
     try {
       candidates = findRotationCandidates(
-        gray, imageData.width, imageData.height, center, scale
+        gray,
+        width,
+        height,
+        marker,
+        scale,
+        rotationHint
       );
     } catch (error) {
       lastError = error;
@@ -1007,26 +1241,66 @@ function decodeImageData(imageData) {
     }
 
     for (const candidate of candidates) {
-      try {
-        return {
-          content: decodeWithGeometry(
-            gray, imageData.width, imageData.height, center, scale, candidate
-          ),
-          diagnostics: {
-            center,
-            scale,
-            rotation: candidate.rotation,
-            direction: candidate.direction,
-            rotationScore: candidate.score,
-          },
-        };
-      } catch (error) {
-        lastError = error;
+      for (const center of centers) {
+        try {
+          return {
+            content: decodeWithGeometry(gray, width, height, center, scale, candidate),
+            diagnostics: {
+              center,
+              marker,
+              scale,
+              rotation: candidate.rotation,
+              direction: candidate.direction,
+              rotationScore: candidate.score,
+              rotationHint,
+              codeDiameterRatio: 2 * OUTER_RADIUS * scale / Math.min(width, height),
+            },
+          };
+        } catch (error) {
+          lastError = error;
+        }
       }
     }
   }
 
-  throw lastError ?? new Error("Não foi possível recuperar o conteúdo desta imagem.");
+  const finalError = lastError ?? new Error("Não foi possível recuperar o conteúdo desta imagem.");
+  finalError.diagnostics = {
+    ...(finalError.diagnostics ?? {}),
+    marker,
+    rotationHint,
+    scale: scaleEstimate.scale,
+    codeDiameterRatio: 2 * OUTER_RADIUS * scaleEstimate.scale / Math.min(width, height),
+  };
+  throw finalError;
+}
+
+function decodeImageData(imageData) {
+  const originalGray = imageDataToGray(imageData);
+  const normalized = normalizeGray(originalGray);
+  const quality = calculateFrameQuality(normalized, imageData.width, imageData.height);
+  const variants = [
+    { name: "normalizada", gray: normalized },
+    { name: "realçada", gray: sharpenGray(normalized, imageData.width, imageData.height) },
+  ];
+  let lastError = null;
+
+  for (const variant of variants) {
+    try {
+      const result = decodeGrayVariant(variant.gray, imageData.width, imageData.height);
+      result.diagnostics.variant = variant.name;
+      result.diagnostics.quality = quality;
+      return result;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const finalError = lastError ?? new Error("Não foi possível recuperar o conteúdo desta imagem.");
+  finalError.diagnostics = {
+    ...(finalError.diagnostics ?? {}),
+    quality,
+  };
+  throw finalError;
 }
 
 function drawSourceToAnalysisCanvas(source, sourceWidth, sourceHeight) {
@@ -1057,12 +1331,75 @@ function drawSourceToAnalysisCanvas(source, sourceWidth, sourceHeight) {
 
 let generatedBlob = null;
 let cameraStream = null;
+let cameraTrack = null;
 let autoScanTimer = null;
 let decodingInProgress = false;
+let torchEnabled = false;
+let lastCameraContent = null;
+let cameraConfirmationCount = 0;
 
 function setMessage(element, text, type = "") {
   element.textContent = text;
   element.className = `message${type ? ` ${type}` : ""}`;
+}
+
+function setScanState(text, state = "") {
+  const shell = document.getElementById("camera-shell");
+  const element = document.getElementById("scan-state");
+  element.textContent = text;
+  shell.classList.toggle("is-searching", state === "searching");
+  shell.classList.toggle("is-ready", state === "ready");
+}
+
+function setFeedbackChip(id, label, value, level = "") {
+  const element = document.getElementById(id);
+  element.textContent = `${label}: ${value}`;
+  element.className = `feedback-chip${level ? ` ${level}` : ""}`;
+}
+
+function updateCameraFeedback(diagnostics = {}) {
+  const quality = diagnostics.quality ?? {};
+  const sharpness = quality.sharpness;
+  const brightness = quality.brightness;
+  const ratio = diagnostics.codeDiameterRatio;
+
+  if (Number.isFinite(sharpness)) {
+    if (sharpness >= 650) setFeedbackChip("feedback-focus", "Nitidez", "boa", "good");
+    else if (sharpness >= 260) setFeedbackChip("feedback-focus", "Nitidez", "média", "warn");
+    else setFeedbackChip("feedback-focus", "Nitidez", "baixa", "bad");
+  } else {
+    setFeedbackChip("feedback-focus", "Nitidez", "—");
+  }
+
+  if (Number.isFinite(ratio)) {
+    if (ratio < 0.66) setFeedbackChip("feedback-size", "Tamanho", "aproxime", "warn");
+    else if (ratio > 0.94) setFeedbackChip("feedback-size", "Tamanho", "afaste", "warn");
+    else setFeedbackChip("feedback-size", "Tamanho", "bom", "good");
+  } else {
+    setFeedbackChip("feedback-size", "Tamanho", "—");
+  }
+
+  if (Number.isFinite(brightness)) {
+    if (brightness < 85) setFeedbackChip("feedback-light", "Luz", "escura", "bad");
+    else setFeedbackChip("feedback-light", "Luz", "boa", "good");
+  } else {
+    setFeedbackChip("feedback-light", "Luz", "—");
+  }
+}
+
+function guidanceFromDiagnostics(diagnostics = {}) {
+  const quality = diagnostics.quality ?? {};
+  const ratio = diagnostics.codeDiameterRatio;
+
+  if (Number.isFinite(ratio) && ratio < 0.66) return "Aproxime o celular lentamente.";
+  if (Number.isFinite(ratio) && ratio > 0.94) return "Afaste um pouco para mostrar todos os anéis.";
+  if (Number.isFinite(quality.sharpness) && quality.sharpness < 260) {
+    return "Mantenha o celular parado até a imagem ficar nítida.";
+  }
+  if (Number.isFinite(quality.brightness) && quality.brightness < 85) {
+    return "Aumente a iluminação ou use o botão de luz.";
+  }
+  return "Centralize o quadrado e mantenha os cinco anéis dentro do guia.";
 }
 
 function canvasToBlob(canvas) {
@@ -1111,23 +1448,25 @@ function showDecodedResult(content) {
   }
 }
 
-async function processImageData(imageData, sourceLabel) {
-  if (decodingInProgress) return;
+async function processImageData(imageData, sourceLabel, options = {}) {
+  const { silent = false } = options;
+  if (decodingInProgress) throw new Error("Uma leitura já está em andamento.");
+
   decodingInProgress = true;
   const decoderMessage = document.getElementById("decoder-message");
-  setMessage(decoderMessage, `Analisando ${sourceLabel}...`);
+  if (!silent) setMessage(decoderMessage, `Analisando ${sourceLabel}...`);
 
   try {
     await new Promise((resolve) => requestAnimationFrame(resolve));
-    const result = decodeImageData(imageData);
-    showDecodedResult(result.content);
-    setMessage(decoderMessage, "Código lido e validado pelo CRC32.", "success");
+    return decodeImageData(imageData);
   } catch (error) {
-    setMessage(
-      decoderMessage,
-      `${error.message} O código deve ocupar a maior parte do enquadramento e estar o mais plano possível.`,
-      "error"
-    );
+    if (!silent) {
+      setMessage(
+        decoderMessage,
+        `${error.message} Mantenha o código inteiro, centralizado e o mais plano possível.`,
+        "error"
+      );
+    }
     throw error;
   } finally {
     decodingInProgress = false;
@@ -1149,6 +1488,70 @@ function switchReaderMode(mode) {
   galleryPanel.classList.toggle("active", !cameraActive);
   cameraPanel.hidden = !cameraActive;
   galleryPanel.hidden = cameraActive;
+
+  if (!cameraActive) stopCamera();
+}
+
+function cancelAutoScan() {
+  if (autoScanTimer) {
+    clearTimeout(autoScanTimer);
+    autoScanTimer = null;
+  }
+}
+
+function scheduleAutoScan(delay = CONFIG.cameraScanIntervalMs) {
+  cancelAutoScan();
+  if (!cameraStream || !document.getElementById("auto-scan").checked) return;
+  autoScanTimer = setTimeout(async () => {
+    autoScanTimer = null;
+    const recognized = await scanCameraFrame({ silent: true, manual: false });
+    if (!recognized && cameraStream && document.getElementById("auto-scan").checked) {
+      scheduleAutoScan();
+    }
+  }, delay);
+}
+
+async function configureCameraTrack(track) {
+  const capabilities = track.getCapabilities?.() ?? {};
+  const advanced = {};
+
+  if (Array.isArray(capabilities.focusMode) && capabilities.focusMode.includes("continuous")) {
+    advanced.focusMode = "continuous";
+  }
+  if (Array.isArray(capabilities.exposureMode) && capabilities.exposureMode.includes("continuous")) {
+    advanced.exposureMode = "continuous";
+  }
+  if (Array.isArray(capabilities.whiteBalanceMode) && capabilities.whiteBalanceMode.includes("continuous")) {
+    advanced.whiteBalanceMode = "continuous";
+  }
+
+  if (Object.keys(advanced).length) {
+    try {
+      await track.applyConstraints({ advanced: [advanced] });
+    } catch {
+      // Alguns navegadores anunciam a capacidade, mas não aceitam a restrição.
+    }
+  }
+
+  const torchButton = document.getElementById("torch-button");
+  torchButton.hidden = !capabilities.torch;
+
+  const zoomControl = document.getElementById("zoom-control");
+  const zoomInput = document.getElementById("camera-zoom");
+  const zoomValue = document.getElementById("camera-zoom-value");
+
+  if (capabilities.zoom && Number.isFinite(capabilities.zoom.min)) {
+    zoomInput.min = capabilities.zoom.min;
+    zoomInput.max = capabilities.zoom.max;
+    zoomInput.step = capabilities.zoom.step || 0.1;
+    const settings = track.getSettings?.() ?? {};
+    const initialZoom = settings.zoom ?? capabilities.zoom.min;
+    zoomInput.value = initialZoom;
+    zoomValue.value = `${Number(initialZoom).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}×`;
+    zoomControl.hidden = false;
+  } else {
+    zoomControl.hidden = true;
+  }
 }
 
 async function startCamera() {
@@ -1160,81 +1563,144 @@ async function startCamera() {
     return;
   }
 
+  stopCamera();
+  setScanState("Solicitando acesso à câmera…", "searching");
+
   try {
     cameraStream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
+        width: { ideal: 2560, min: 1280 },
+        height: { ideal: 1440, min: 720 },
+        frameRate: { ideal: 30, max: 60 },
       },
       audio: false,
     });
 
+    cameraTrack = cameraStream.getVideoTracks()[0] ?? null;
+    if (cameraTrack) await configureCameraTrack(cameraTrack);
+
     video.srcObject = cameraStream;
     await video.play();
+
     document.getElementById("camera-empty").classList.add("hidden");
     document.getElementById("start-camera-button").disabled = true;
     document.getElementById("scan-camera-button").disabled = false;
     document.getElementById("stop-camera-button").disabled = false;
-    setMessage(decoderMessage, "Câmera ativa. Alinhe os anéis ao guia e mantenha o marcador no centro.");
-    updateAutoScan();
+    setMessage(decoderMessage, "Câmera ativa. A leitura automática procura o código continuamente.");
+    setScanState("Procurando código…", "searching");
+    lastCameraContent = null;
+    cameraConfirmationCount = 0;
+    scheduleAutoScan(250);
   } catch (error) {
+    stopCamera();
     setMessage(
       decoderMessage,
-      "Não foi possível acessar a câmera. Verifique a permissão e abra a página em localhost ou HTTPS.",
+      "Não foi possível acessar a câmera. Verifique a permissão e abra a página em HTTPS.",
       "error"
     );
+    setScanState("Câmera indisponível");
+  }
+}
+
+async function setTorch(enabled) {
+  if (!cameraTrack) return;
+  try {
+    await cameraTrack.applyConstraints({ advanced: [{ torch: enabled }] });
+    torchEnabled = enabled;
+    document.getElementById("torch-button").textContent = enabled ? "Desligar luz" : "Ligar luz";
+  } catch {
+    setMessage(document.getElementById("decoder-message"), "A luz não pôde ser controlada neste aparelho.", "warning");
   }
 }
 
 function stopCamera() {
-  if (autoScanTimer) {
-    clearInterval(autoScanTimer);
-    autoScanTimer = null;
-  }
+  cancelAutoScan();
+
   if (cameraStream) {
     for (const track of cameraStream.getTracks()) track.stop();
-    cameraStream = null;
   }
+  cameraStream = null;
+  cameraTrack = null;
+  torchEnabled = false;
+  lastCameraContent = null;
+  cameraConfirmationCount = 0;
 
   const video = document.getElementById("camera-video");
-  video.srcObject = null;
-  document.getElementById("camera-empty").classList.remove("hidden");
+  if (video) video.srcObject = null;
+
+  document.getElementById("camera-empty")?.classList.remove("hidden");
   document.getElementById("start-camera-button").disabled = false;
   document.getElementById("scan-camera-button").disabled = true;
   document.getElementById("stop-camera-button").disabled = true;
+  document.getElementById("torch-button").hidden = true;
+  document.getElementById("torch-button").textContent = "Ligar luz";
+  document.getElementById("zoom-control").hidden = true;
+  setFeedbackChip("feedback-focus", "Nitidez", "—");
+  setFeedbackChip("feedback-size", "Tamanho", "—");
+  setFeedbackChip("feedback-light", "Luz", "—");
+  setScanState("Câmera desativada");
 }
 
-async function scanCameraFrame(silentFailure = false) {
+function acceptCameraResult(result, manual) {
+  if (manual || CONFIG.cameraConfirmations <= 1) {
+    cameraConfirmationCount = CONFIG.cameraConfirmations;
+  } else if (result.content === lastCameraContent) {
+    cameraConfirmationCount += 1;
+  } else {
+    lastCameraContent = result.content;
+    cameraConfirmationCount = 1;
+  }
+
+  if (cameraConfirmationCount < CONFIG.cameraConfirmations) {
+    setScanState("Código encontrado; confirmando…", "searching");
+    return false;
+  }
+
+  showDecodedResult(result.content);
+  setMessage(document.getElementById("decoder-message"), "Código lido e validado pelo CRC32.", "success");
+  setScanState("Código reconhecido", "ready");
+  cancelAutoScan();
+
+  if (navigator.vibrate) navigator.vibrate(80);
+  return true;
+}
+
+async function scanCameraFrame(options = {}) {
+  const { silent = false, manual = false } = options;
   const video = document.getElementById("camera-video");
-  if (!cameraStream || video.readyState < 2 || decodingInProgress) return;
+  if (!cameraStream || video.readyState < 2 || decodingInProgress) return false;
+
+  setScanState(manual ? "Analisando quadro…" : "Procurando código…", "searching");
 
   try {
     const imageData = drawSourceToAnalysisCanvas(video, video.videoWidth, video.videoHeight);
-    await processImageData(imageData, "a imagem da câmera");
-    if (autoScanTimer) {
-      clearInterval(autoScanTimer);
-      autoScanTimer = null;
-    }
+    const result = await processImageData(imageData, "a imagem da câmera", { silent: true });
+    updateCameraFeedback(result.diagnostics);
+    return acceptCameraResult(result, manual);
   } catch (error) {
-    if (silentFailure) {
+    const diagnostics = error.diagnostics ?? {};
+    updateCameraFeedback(diagnostics);
+    const guidance = guidanceFromDiagnostics(diagnostics);
+    setScanState(guidance, "searching");
+
+    if (!silent || manual) {
       setMessage(
         document.getElementById("decoder-message"),
-        "Procurando o código... aproxime, centralize e reduza reflexos.",
+        `${error.message} ${guidance}`,
         "warning"
       );
     }
+    return false;
   }
 }
 
 function updateAutoScan() {
-  const enabled = document.getElementById("auto-scan").checked;
-  if (autoScanTimer) {
-    clearInterval(autoScanTimer);
-    autoScanTimer = null;
-  }
-  if (enabled && cameraStream) {
-    autoScanTimer = setInterval(() => scanCameraFrame(true), 1300);
+  if (document.getElementById("auto-scan").checked) {
+    scheduleAutoScan(180);
+  } else {
+    cancelAutoScan();
+    if (cameraStream) setScanState("Leitura automática pausada");
   }
 }
 
@@ -1255,7 +1721,9 @@ async function handleGalleryFile(file) {
   try {
     const bitmap = await createImageBitmap(file);
     const imageData = drawSourceToAnalysisCanvas(bitmap, bitmap.width, bitmap.height);
-    await processImageData(imageData, "a imagem selecionada");
+    const result = await processImageData(imageData, "a imagem selecionada");
+    showDecodedResult(result.content);
+    setMessage(decoderMessage, "Código lido e validado pelo CRC32.", "success");
     bitmap.close();
   } catch (error) {
     // processImageData já apresentou uma mensagem mais específica.
@@ -1341,8 +1809,22 @@ function initializeInterface() {
   document.getElementById("gallery-tab").addEventListener("click", () => switchReaderMode("gallery"));
   document.getElementById("start-camera-button").addEventListener("click", startCamera);
   document.getElementById("stop-camera-button").addEventListener("click", stopCamera);
-  document.getElementById("scan-camera-button").addEventListener("click", () => scanCameraFrame(false));
+  document.getElementById("scan-camera-button").addEventListener("click", () => {
+    scanCameraFrame({ silent: false, manual: true });
+  });
   document.getElementById("auto-scan").addEventListener("change", updateAutoScan);
+  document.getElementById("torch-button").addEventListener("click", () => setTorch(!torchEnabled));
+  document.getElementById("camera-zoom").addEventListener("input", async (event) => {
+    const value = Number(event.target.value);
+    document.getElementById("camera-zoom-value").value =
+      `${value.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}×`;
+    if (!cameraTrack) return;
+    try {
+      await cameraTrack.applyConstraints({ advanced: [{ zoom: value }] });
+    } catch {
+      setMessage(document.getElementById("decoder-message"), "O zoom não pôde ser alterado.", "warning");
+    }
+  });
   document.getElementById("gallery-input").addEventListener("change", (event) => {
     handleGalleryFile(event.target.files?.[0]);
   });
